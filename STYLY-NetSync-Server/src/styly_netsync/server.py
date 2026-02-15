@@ -256,6 +256,7 @@ class NetSyncServer:
         self.ctrl_unicast_sent = 0
         self.ctrl_unicast_wouldblock = 0
         self.ctrl_unicast_dropped = 0
+        self.control_drop_count = 0
 
         # PUB socket monitor for tracking SUB connections
         self._pub_monitor: zmq.sugar.socket.Socket[bytes] | None = None
@@ -355,6 +356,7 @@ class NetSyncServer:
 
         # Statistics
         self.message_count = 0
+        self.transform_message_count = 0
         self.broadcast_count = 0
         self.skipped_broadcasts = 0
 
@@ -366,6 +368,20 @@ class NetSyncServer:
         """Thread-safe increment of statistics"""
         with self._stats_lock:
             setattr(self, stat_name, getattr(self, stat_name) + amount)
+
+    def _get_stats_snapshot(self) -> dict[str, int]:
+        """Thread-safe snapshot of frequently observed counters."""
+        with self._stats_lock:
+            return {
+                "message_count": self.message_count,
+                "transform_message_count": self.transform_message_count,
+                "broadcast_count": self.broadcast_count,
+                "skipped_broadcasts": self.skipped_broadcasts,
+                "ctrl_unicast_sent": self.ctrl_unicast_sent,
+                "ctrl_unicast_wouldblock": self.ctrl_unicast_wouldblock,
+                "ctrl_unicast_dropped": self.ctrl_unicast_dropped,
+                "control_drop_count": self.control_drop_count,
+            }
 
     def _bump_fd_soft_limit(self, target: int) -> None:
         """Best-effort bump of RLIMIT_NOFILE for macOS/Linux."""
@@ -1044,6 +1060,7 @@ class NetSyncServer:
                                 logger.warning("Received message with None data")
                                 continue
                             if msg_type == binary_serializer.MSG_CLIENT_POSE:
+                                self._increment_stat("transform_message_count")
                                 self._handle_client_transform(
                                     client_identity, room_id, data, raw_payload
                                 )
@@ -1629,6 +1646,7 @@ class NetSyncServer:
         last_cleanup: float = 0.0
         last_device_id_cleanup: float = 0.0
         last_log = time.monotonic()
+        last_stats = self._get_stats_snapshot()
         DEVICE_ID_CLEANUP_INTERVAL = 60.0  # Clean up expired device IDs every minute
 
         while self.running:
@@ -1679,6 +1697,40 @@ class NetSyncServer:
                         1 for flag in self.room_dirty_flags.values() if flag
                     )
                     total_device_ids = len(self.device_id_last_seen)
+                    sub_connections = self._get_sub_connection_count()
+
+                    router_q = self._router_queue_ctrl.qsize()
+                    router_q_max = self._router_queue_ctrl.maxsize
+                    pub_q = self._pub_queue_ctrl.qsize()
+                    pub_q_max = self._pub_queue_ctrl.maxsize
+                    with self._coalesce_lock:
+                        coalesce_q = len(self._coalesce_latest)
+
+                    current_stats = self._get_stats_snapshot()
+                    elapsed = max(current_time - last_log, 1e-6)
+                    recv_rate = (
+                        current_stats["message_count"] - last_stats["message_count"]
+                    ) / elapsed
+                    transform_rate = (
+                        current_stats["transform_message_count"]
+                        - last_stats["transform_message_count"]
+                    ) / elapsed
+                    ctrl_wouldblock_delta = (
+                        current_stats["ctrl_unicast_wouldblock"]
+                        - last_stats["ctrl_unicast_wouldblock"]
+                    )
+                    ctrl_drop_delta = (
+                        current_stats["ctrl_unicast_dropped"]
+                        - last_stats["ctrl_unicast_dropped"]
+                    )
+                    pub_drop_delta = (
+                        current_stats["control_drop_count"]
+                        - last_stats["control_drop_count"]
+                    )
+                    skip_delta = (
+                        current_stats["skipped_broadcasts"]
+                        - last_stats["skipped_broadcasts"]
+                    )
 
                     # Get FD information for status log
                     open_fds, soft, _ = self._get_fd_snapshot()
@@ -1692,10 +1744,27 @@ class NetSyncServer:
                     logger.info(
                         f"Status: {len(self.rooms)} rooms, {normal_clients} normal clients, "
                         f"{stealth_clients} stealth clients, "
-                        f"{dirty_rooms} dirty rooms, {total_device_ids} tracked device IDs"
+                        f"{dirty_rooms} dirty rooms, {total_device_ids} tracked IDs"
                         f"{fd_part}"
                     )
+                    logger.info(
+                        f"Flow: sub_clients={sub_connections}, "
+                        f"recv_rate={recv_rate:.1f}/s, pose_rate={transform_rate:.1f}/s"
+                    )
+                    logger.info(
+                        "Queue: "
+                        f"router_q={router_q}/{router_q_max}, "
+                        f"pub_q={pub_q}/{pub_q_max}, "
+                        f"latest_q={coalesce_q}/{self.MAX_COALESCE_BUFFER_SIZE}"
+                    )
+                    logger.info(
+                        "Delta: "
+                        f"router_block={ctrl_wouldblock_delta}, "
+                        f"router_drop={ctrl_drop_delta}, "
+                        f"pub_drop={pub_drop_delta}, send_skip={skip_delta}"
+                    )
                     last_log = current_time
+                    last_stats = current_stats
 
                 time.sleep(self.MAIN_LOOP_SLEEP)  # 50Hz loop for better responsiveness
 
